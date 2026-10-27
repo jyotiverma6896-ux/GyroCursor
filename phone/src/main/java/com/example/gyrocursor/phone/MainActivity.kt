@@ -1,16 +1,21 @@
 package com.example.gyrocursor.phone
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Activity
+import android.bluetooth.BluetoothAdapter
+import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.PackageManager
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
-import android.text.InputType
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -23,21 +28,19 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
-import java.net.Inet4Address
 import kotlin.math.abs
 
+@SuppressLint("MissingPermission")
 class MainActivity : Activity() {
 
     private lateinit var prefs: SharedPreferences
     private lateinit var status: TextView
-    private lateinit var ipField: EditText
-    private lateinit var pinField: EditText
-    private lateinit var found: LinearLayout
+    private lateinit var devices: LinearLayout
     private lateinit var sm: SensorManager
     private var gyro: Sensor? = null
-    private val sender = Sender()
+    private lateinit var bt: BtHid
+    private val handler = Handler(Looper.getMainLooper())
 
-    // gyro state
     private var sens = 5
     private var accDx = 0f
     private var accDy = 0f
@@ -45,12 +48,7 @@ class MainActivity : Activity() {
     private var lastSend = 0L
     private var downMs = 0L
     private var moved = 0
-
-    // discovery
-    private val nsd by lazy { getSystemService(NSD_SERVICE) as NsdManager }
-    private val queue = java.util.ArrayDeque<NsdServiceInfo>()
-    private var resolving = false
-    private val shownIps = HashSet<String>()
+    private var buttons = 0
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -68,6 +66,23 @@ class MainActivity : Activity() {
     private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
     private fun setStatus(t: String) = runOnUiThread { status.text = t }
 
+    // ---- mouse helpers ----
+    private fun click() {
+        buttons = 1
+        bt.mouse(buttons, 0, 0)
+        handler.postDelayed({ buttons = 0; bt.mouse(0, 0, 0) }, 45)
+    }
+
+    private fun rightClick() {
+        bt.mouse(2, 0, 0)
+        handler.postDelayed({ bt.mouse(0, 0, 0) }, 45)
+    }
+
+    private fun longPress() {
+        bt.mouse(1, 0, 0)
+        handler.postDelayed({ bt.mouse(0, 0, 0) }, 700)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -75,32 +90,26 @@ class MainActivity : Activity() {
         sm = getSystemService(SENSOR_SERVICE) as SensorManager
         gyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         sens = prefs.getInt("sens", 5)
+        bt = BtHid(this) { setStatus(it); runOnUiThread { refreshDevices() } }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(12), dp(40), dp(12), dp(24))
         }
 
-        status = TextView(this).apply { text = "TV ka IP aur PIN daalo"; textSize = 16f }
+        status = TextView(this).apply { text = "Bluetooth permission do"; textSize = 16f }
         root.addView(status)
 
-        ipField = EditText(this).apply {
-            hint = "TV ka IP (TV app me dikhta hai)"
-            setText(prefs.getString("ip", ""))
-            inputType = InputType.TYPE_CLASS_PHONE
-        }
-        root.addView(ipField)
-        pinField = EditText(this).apply {
-            hint = "TV ka PIN (4 digit)"
-            setText(prefs.getString("pin", ""))
-            inputType = InputType.TYPE_CLASS_NUMBER
-        }
-        root.addView(pinField)
-        root.addView(button("Connect") { connect() })
-        found = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(found)
+        root.addView(button("Phone ko discoverable karo (TV se pair ke liye)") {
+            startActivity(
+                Intent(BluetoothAdapter.ACTION_REQUEST_DISCOVERABLE)
+                    .putExtra(BluetoothAdapter.EXTRA_DISCOVERABLE_DURATION, 120)
+            )
+        })
+        root.addView(TextView(this).apply { text = "Paired devices (TV par tap karo):" })
+        devices = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(devices)
 
-        // gyro pad
         val pad = Button(this).apply {
             text = "DABAKE RAKHO + PHONE GHUMAO\n(sirf tap = click)"
             textSize = 16f
@@ -133,58 +142,70 @@ class MainActivity : Activity() {
         })
 
         root.addView(row(
-            button("Click") { sender.send("C") },
-            button("Long press") { sender.send("L") },
-            button("Center") { sender.send("Z") }
+            button("Click") { click() },
+            button("Right click") { rightClick() },
+            button("Long press") { longPress() }
         ))
         root.addView(row(
-            button("Scroll ▲") { sender.send("S u") },
-            button("Scroll ▼") { sender.send("S d") }
+            button("Scroll ▲") { bt.mouse(0, 0, 0, 1) },
+            button("Scroll ▼") { bt.mouse(0, 0, 0, -1) }
         ))
         root.addView(row(
-            button("Back") { sender.send("B") },
-            button("Home") { sender.send("H") }
+            button("Back") { bt.consumer(BtHid.BACK) },
+            button("Home") { bt.consumer(BtHid.HOME) }
         ))
 
-        val kb = EditText(this).apply { hint = "TV ke text box me likhne ke liye" }
+        val kb = EditText(this).apply { hint = "TV ke text box me likhne ke liye (English)" }
         root.addView(kb)
         root.addView(row(
             button("Send") {
                 val t = kb.text.toString()
-                if (t.isNotEmpty()) sender.send("T $t")
+                if (t.isNotEmpty()) bt.typeText(t)
                 kb.setText("")
             },
-            button("⌫") { sender.send("X") }
+            button("⌫") { bt.key(BtHid.KEY_BACKSPACE) },
+            button("Enter") { bt.typeText("\n") }
         ))
 
         setContentView(ScrollView(this).apply { addView(root) })
-
-        try {
-            nsd.discoverServices("_gyrocursor._udp", NsdManager.PROTOCOL_DNS_SD, discListener)
-        } catch (_: Exception) {
-        }
-
-        if (ipField.text.isNotEmpty() && pinField.text.isNotEmpty()) connect()
+        ensurePermission()
     }
 
-    private fun connect() {
-        val ip = ipField.text.toString().trim()
-        val pin = pinField.text.toString().trim()
-        if (ip.isEmpty() || pin.isEmpty()) { toast("IP aur PIN dono daalo"); return }
-        prefs.edit().putString("ip", ip).putString("pin", pin).apply()
-        sender.host = ip
-        sender.pin = pin
-        setStatus("TV ko dhundh raha hoon...")
-        sender.ping { r ->
-            setStatus(
-                when {
-                    r == "OK" -> "Connected ✔  $ip"
-                    r == "BADPIN" -> "PIN galat hai"
-                    r == "TIMEOUT" -> "TV jawab nahi de raha. TV par app + service on hai? Same WiFi?"
-                    else -> "Error: $r"
-                }
-            )
+    private fun ensurePermission() {
+        if (Build.VERSION.SDK_INT >= 31 &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 1)
+        } else {
+            startBt()
         }
+    }
+
+    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
+        super.onRequestPermissionsResult(code, perms, res)
+        if (res.isNotEmpty() && res[0] == PackageManager.PERMISSION_GRANTED) startBt()
+        else setStatus("Bluetooth permission ke bina app nahi chalega")
+    }
+
+    private fun startBt() {
+        bt.start()
+        refreshDevices()
+    }
+
+    private fun refreshDevices() {
+        if (!::devices.isInitialized) return
+        devices.removeAllViews()
+        try {
+            bt.pairedDevices().forEach { d ->
+                devices.addView(button("${d.name ?: "Unknown"}  (${d.address})") { bt.connect(d) })
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshDevices()
     }
 
     // ---------- gyro mouse ----------
@@ -207,7 +228,7 @@ class MainActivity : Activity() {
                 val ix = accDx.toInt()
                 val iy = accDy.toInt()
                 if (ix != 0 || iy != 0) {
-                    sender.send("M $ix $iy")
+                    bt.mouse(buttons, ix, iy)
                     accDx -= ix
                     accDy -= iy
                     moved += abs(ix) + abs(iy)
@@ -229,56 +250,7 @@ class MainActivity : Activity() {
 
     private fun stopGyro(released: Boolean) {
         sm.unregisterListener(gyroListener)
-        if (released && moved < 6 && SystemClock.uptimeMillis() - downMs < 250) sender.send("C")
-    }
-
-    // ---------- discovery ----------
-
-    private val discListener = object : NsdManager.DiscoveryListener {
-        override fun onStartDiscoveryFailed(t: String?, c: Int) {}
-        override fun onStopDiscoveryFailed(t: String?, c: Int) {}
-        override fun onDiscoveryStarted(t: String?) {}
-        override fun onDiscoveryStopped(t: String?) {}
-        override fun onServiceLost(i: NsdServiceInfo?) {}
-        override fun onServiceFound(i: NsdServiceInfo) {
-            synchronized(queue) { queue.add(i) }
-            resolveNext()
-        }
-    }
-
-    @Synchronized
-    private fun resolveNext() {
-        if (resolving) return
-        val next = synchronized(queue) { queue.poll() } ?: return
-        resolving = true
-        try {
-            nsd.resolveService(next, object : NsdManager.ResolveListener {
-                override fun onResolveFailed(i: NsdServiceInfo?, c: Int) {
-                    resolving = false
-                    resolveNext()
-                }
-                override fun onServiceResolved(i: NsdServiceInfo) {
-                    resolving = false
-                    val h = i.host
-                    if (h is Inet4Address) addFound(i.serviceName, h.hostAddress ?: "")
-                    resolveNext()
-                }
-            })
-        } catch (_: Exception) {
-            resolving = false
-        }
-    }
-
-    private fun addFound(name: String, ip: String) {
-        if (ip.isEmpty()) return
-        runOnUiThread {
-            if (shownIps.add(ip)) {
-                found.addView(button("$name  ($ip)") {
-                    ipField.setText(ip)
-                    connect()
-                })
-            }
-        }
+        if (released && moved < 6 && SystemClock.uptimeMillis() - downMs < 250) click()
     }
 
     override fun onPause() {
@@ -288,7 +260,6 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        sender.close()
-        try { nsd.stopServiceDiscovery(discListener) } catch (_: Exception) {}
+        bt.close()
     }
 }

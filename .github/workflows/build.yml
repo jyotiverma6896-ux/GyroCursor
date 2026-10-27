@@ -1,4 +1,4 @@
-name: Build APKs
+name: Build APK
 on:
   push:
   workflow_dispatch:
@@ -14,12 +14,8 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
-      - run: gradle assembleDebug --stacktrace
-      - run: |
-          mkdir out
-          cp phone/build/outputs/apk/debug/phone-debug.apk out/
-          cp tv/build/outputs/apk/debug/tv-debug.apk out/
+      - run: gradle :phone:assembleDebug --stacktrace
       - uses: actions/upload-artifact@v4
         with:
-          name: GyroCursor-apks
-          path: out/
+          name: GyroCursor-apk
+          path: phone/build/outputs/apk/debug/phone-debug.apk

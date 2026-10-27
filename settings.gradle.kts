@@ -6,4 +6,4 @@ dependencyResolutionManagement {
     repositories { google(); mavenCentral() }
 }
 rootProject.name = "GyroCursor"
-include(":phone", ":tv")
+include(":phone")
